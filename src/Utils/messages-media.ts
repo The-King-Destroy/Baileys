@@ -1,9 +1,9 @@
 import { Boom } from '@hapi/boom'
-import { AxiosRequestConfig } from 'axios'
+import axios, { AxiosRequestConfig } from 'axios'
 import { exec } from 'child_process'
 import * as Crypto from 'crypto'
 import { once } from 'events'
-import { createReadStream, createWriteStream, promises as fs, WriteStream } from 'fs'
+import { createReadStream, createWriteStream, promises as fs, writeFileSync, WriteStream } from 'fs'
 import type { IAudioMetadata } from 'music-metadata'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -204,6 +204,54 @@ export async function getAudioDuration(buffer: Buffer | string | Readable) {
         return metadata.format.duration
 }
 
+/**
+  referenced from and modifying https://github.com/wppconnect-team/wa-js/blob/main/src/chat/functions/prepareAudioWaveform.ts
+ */
+export async function getAudioWaveform(buffer: Buffer | string | Readable, logger?: Logger) {
+        try {
+                const audioDecode = (buffer: Buffer | ArrayBuffer | Uint8Array) => import('audio-decode').then(({ default: audioDecode }) => audioDecode(buffer))
+                let audioData: Buffer
+                if(Buffer.isBuffer(buffer)) {
+                        audioData = buffer
+                } else if(typeof buffer === 'string') {
+                        const rStream = createReadStream(buffer)
+                        audioData = await toBuffer(rStream)
+                } else {
+                        audioData = await toBuffer(buffer)
+                }
+
+                const audioBuffer = await audioDecode(audioData)
+
+                const rawData = audioBuffer.getChannelData(0) // We only need to work with one channel of data
+                const samples = 64 // Number of samples we want to have in our final data set
+                const blockSize = Math.floor(rawData.length / samples) // the number of samples in each subdivision
+                const filteredData: number[] = []
+                for(let i = 0; i < samples; i++) {
+                          const blockStart = blockSize * i // the location of the first sample in the block
+                          let sum = 0
+                          for(let j = 0; j < blockSize; j++) {
+                                sum = sum + Math.abs(rawData[blockStart + j]) // find the sum of all the samples in the block
+                        }
+
+                        filteredData.push(sum / blockSize) // divide the sum by the block size to get the average
+                }
+
+                // This guarantees that the largest data point will be set to 1, and the rest of the data will scale proportionally.
+                const multiplier = Math.pow(Math.max(...filteredData), -1)
+                const normalizedData = filteredData.map((n) => n * multiplier)
+
+                // Generate waveform like WhatsApp
+                const waveform = new Uint8Array(
+                        normalizedData.map((n) => Math.floor(100 * n))
+                )
+
+                return waveform
+        } catch(e) {
+                logger?.debug('Failed to generate waveform: ' + e)
+        }
+}
+
+
 export const toReadable = (buffer: Buffer) => {
         const readable = new Readable({ read: () => {} })
         readable.push(buffer)
@@ -276,7 +324,6 @@ export async function generateThumbnail(
 }
 
 export const getHttpStream = async(url: string | URL, options: AxiosRequestConfig & { isStream?: true } = {}) => {
-        const { default: axios } = await import('axios')
         const fetched = await axios.get(url.toString(), { ...options, responseType: 'stream' })
         return fetched.data as Readable
 }
@@ -285,6 +332,59 @@ type EncryptedStreamOptions = {
         saveOriginalFileIfRequired?: boolean
         logger?: Logger
         opts?: AxiosRequestConfig
+}
+
+export const prepareStream = async(
+        media: WAMediaUpload,
+        mediaType: MediaType,
+        { logger, saveOriginalFileIfRequired, opts }: EncryptedStreamOptions = {}
+) => {
+
+        const { stream, type } = await getStream(media, opts)
+
+        logger?.debug('fetched media stream')
+
+        let bodyPath: string | undefined
+        let didSaveToTmpPath = false
+        try {
+                const buffer = await toBuffer(stream)
+                if(type === 'file') {
+                        bodyPath = (media as any).url
+                } else if(saveOriginalFileIfRequired) {
+                        bodyPath = join(getTmpFilesDirectory(), mediaType + generateMessageID())
+                        writeFileSync(bodyPath, buffer)
+                        didSaveToTmpPath = true
+                }
+
+                const fileLength = buffer.length
+                const fileSha256 = Crypto.createHash('sha256').update(buffer).digest()
+
+                stream?.destroy()
+                logger?.debug('prepare stream data successfully')
+
+                return {
+                        mediaKey: undefined,
+                        encWriteStream: buffer,
+                        fileLength,
+                        fileSha256,
+                        fileEncSha256: undefined,
+                        bodyPath,
+                        didSaveToTmpPath
+                }
+        } catch (error) {
+                // destroy all streams with error
+                stream.destroy()
+
+                if(didSaveToTmpPath) {
+                        try {
+                                await fs.unlink(bodyPath!)
+                        } catch(err) {
+                                logger?.error({ err }, 'failed to save to tmp path')
+                        }
+                }
+
+                throw error
+        }
 }
 
 export const encryptedStream = async(
@@ -553,27 +653,32 @@ export const getWAUploadToServer = (
         { customUploadHosts, fetchAgent, logger, options }: SocketConfig,
         refreshMediaConn: (force: boolean) => Promise<MediaConnInfo>,
 ): WAMediaUploadFunction => {
-        return async(stream, { mediaType, fileEncSha256B64, timeoutMs }) => {
-                const { default: axios } = await import('axios')
+        return async(stream, { mediaType, fileEncSha256B64, newsletter, timeoutMs }) => {
                 // send a query JSON to obtain the url & auth token to upload our media
                 let uploadInfo = await refreshMediaConn(false)
 
-                let urls: { mediaUrl: string, directPath: string } | undefined
+                let urls: { mediaUrl: string, directPath: string, handle?: string } | undefined
                 const hosts = [ ...customUploadHosts, ...uploadInfo.hosts ]
 
-                const chunks: Buffer[] = []
-                for await (const chunk of stream) {
-                        chunks.push(chunk)
+                const chunks: Buffer[] | Buffer = []
+                if (!Buffer.isBuffer(stream)) {
+                        for await (const chunk of stream) {
+                                chunks.push(chunk)
+                        }
                 }
 
-                const reqBody = Buffer.concat(chunks)
+                const reqBody = Buffer.isBuffer(stream) ? stream : Buffer.concat(chunks)
                 fileEncSha256B64 = encodeBase64EncodedStringForUpload(fileEncSha256B64)
+                let media = MEDIA_PATH_MAP[mediaType]
+                if (newsletter) {
+                        media = media?.replace('/mms/', '/newsletter/newsletter-')
+                }
 
                 for(const { hostname, maxContentLengthBytes } of hosts) {
                         logger.debug(`uploading to "${hostname}"`)
 
                         const auth = encodeURIComponent(uploadInfo.auth) // the auth token
-                        const url = `https://${hostname}${MEDIA_PATH_MAP[mediaType]}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
+                        const url = `https://${hostname}${media}/${fileEncSha256B64}?auth=${auth}&token=${fileEncSha256B64}`
                         let result: any
                         try {
                                 if(maxContentLengthBytes && reqBody.length > maxContentLengthBytes) {
@@ -602,7 +707,8 @@ export const getWAUploadToServer = (
                                 if(result?.url || result?.directPath) {
                                         urls = {
                                                 mediaUrl: result.url,
-                                                directPath: result.direct_path
+                                                directPath: result.direct_path,
+                                                handle: result.handle
                                         }
                                         break
                                 } else {
@@ -734,3 +840,8 @@ const MEDIA_RETRY_STATUS_MAP = {
         [proto.MediaRetryNotification.ResultType.NOT_FOUND]: 404,
         [proto.MediaRetryNotification.ResultType.GENERAL_ERROR]: 418,
 } as const
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function __importStar(arg0: any): any {
+        throw new Error('Function not implemented.')
+}
