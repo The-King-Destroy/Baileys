@@ -1,5 +1,5 @@
 {
-  "name": "@Dev-Diego/Bailey",
+  "name": "@The-King-Destroy/Baileys",
   "version": "6.7.5",
   "description": "Baileys Bot WhatsApp",
   "keywords": [
@@ -12,9 +12,9 @@
     "automation",
     "multi-device"
   ],
-  "homepage": "https://github.com/Dev-Diego/Bailey",
+  "homepage": "https://github.com/The-King-Destroy/Baileys",
   "repository": {
-    "url": "git+ssh://git@github.com/Dev-Diego/Bailey.git"
+    "url": "git+ssh://git@github.com/The-King-Destroy/Baileys.git"
   },
   "license": "MIT",
   "author": "Adhiraj Singh",
